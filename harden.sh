@@ -1,5 +1,12 @@
 
 #!/bin/bash
+set -euo pipefail
+#==========================================
+# CONFIGURATION
+#==========================================
+OPEN_HTTP=true          # set to false if this is not a web server
+OPEN_HTTPS=true         # set to false if this is not a web server
+
 # =======================================================================
 # Linux Server Hardening Script
 # Author: cjemmyyy
@@ -18,9 +25,11 @@ LOG_FILE="/var/log/hardening_report.log"
 log() {
     local MESSAGE="$1"
     local TIMESTAMP
+    local CLEAN
     TIMESTAMP=$(date '+%Y-%m-%d  %H:%M:%S')
+    CLEAN=$(echo "$MESSAGE" | sed 's/\x1b\[[0-9;]*m//g; s/\\033\[[0-9;]*m//g')
     echo -e "$MESSAGE"
-    echo "[$TIMESTAMP] $MESSAGE" >> "$LOG_FILE"
+    echo "[$TIMESTAMP] $CLEAN" >> "$LOG_FILE"
 }
 
 banner() {
@@ -60,9 +69,7 @@ log "[INFO] OS: $(lsb_release -d | cut -f2)"
 banner "Phase 2 - System Update & Package Installation"
 
 log "${GREEN} Updating package list....${NC}"
-apt update -y >> "$LOG_FILE" 2>&1
-
-if [[ $? -eq 0 ]]; then
+if apt update -y >> "$LOG_FILE" 2>&1; then
     log "${GREEN}[OK] Package list updated successfully.${NC}"
 else
     log "${RED}[ERROR] Failed to update package list. Check your internet connection.${NC}"
@@ -70,9 +77,7 @@ else
 fi
 
 log "${GREEN} Upgrading installed packages...${NC}"
-apt upgrade -y >> "$LOG_FILE" 2>&1
-
-if  [[ $? -eq 0 ]]; then
+if apt upgrade -y >> "$LOG_FILE" 2>&1; then
      log "${GREEN}[OK] Packages upgraded succesfully.${NC}"
 else
      log "${RED}[ERROR] Package upgrade failed.${NC}"
@@ -87,11 +92,10 @@ for PACKAGE in "${PACKAGES[@]}"; do
     if dpkg -l | grep -q "^ii  $PACKAGE"; then
         log "${YELLOW}[SKIP] $PACKAGE is already installed.${NC}"
     else
-        apt install -y "$PACKAGE" >> "$LOG_FILE" 2>&1
-        if [[ $? -eq 0 ]]; then
+        if apt install -y "$PACKAGE" >> "$LOG_FILE" 2>&1; then
 	    log "${GREEN}[OK] $PACKAGE installed successfully.${NC}"
         else
-	    log "${RED}[ERROR} Failed to install $PACKAGE.${NC}"
+	    log "${RED}[ERROR] Failed to install $PACKAGE.${NC}"
             exit 1
         fi
     fi
@@ -121,21 +125,36 @@ fi
 # Disabling root login
 log "${GREEN} Disabling root login...${NC}"
 sed -i 's/^#PermitRootLogin.*/PermitRootLogin no/' "$SSHD_CONFIG"
+grep -q "^PermitRootLogin" "$SSHD_CONFIG" || echo "PermitRootLogin no" >> "$SSHD_CONFIG"
 log "${GREEN}[OK] Root login disabled.${NC}"
 
 # Disabling password authentication
 log "${GREEN} Disabling password authentication...${NC}"
+echo ""
+echo -e "${YELLOW}[WARNING] After this step, SSH will only accept key-based authentication. If you have not added your SSH public key to ~/.ssh/authorized_keys, you will be locked out of this server remotely.${NC}"
+echo ""
+read -rp "Have you added your SSH public key to ~/.ssh/authorized_keys? [y/N]: " CONFIRM
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    log "${RED}[ABORT] Add your SSH key first, then re-run the script.${NC}"
+    exit 1
+fi
+
 sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' "$SSHD_CONFIG"
+grep -q "^PasswordAuthentication" "$SSHD_CONFIG" || echo "PasswordAuthentication no" >> "$SSHD_CONFIG"
 log "${GREEN}[OK] Password authentication disabled.${NC}"
 
 # Disabling empty passwords
 log "${GREEN} Disabling empty passwords...${NC}"
 sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' "$SSHD_CONFIG"
+grep -q "^PermitEmptyPasswords" "$SSHD_CONFIG" || echo "PermitEmptyPasswords no" >> "$SSHD_CONFIG"
 log "${GREEN}[OK] Empty passwords disabled.${NC}"
 
 # Limit max auth attempts
 log "${GREEN} Setting max authentication attempts to 3...${NC}"
-sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' "$SSHD_CONFIG"
+grep -q "^#*MaxAuthTries" "$SSHD_CONFIG" \
+    && sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' "$SSHD_CONFIG" \
+    || echo "MaxAuthTries 3" >> "$SSHD_CONFIG"
 log "${GREEN}[OK] MaxAuthTries set to 3.${NC}"
 
 # Verify changes before restarting
@@ -146,22 +165,18 @@ grep -E "^PermitRootLogin|^PasswordAuthentication|^PermitEmptyPassword|^MaxAuthT
 echo ""
 
 # Test config is valid before restarting
-sshd -t >> "$LOG_FILE" 2>&1
-
-if [[ $? -eq 0 ]]; then
+if sshd -t >> "$LOG_FILE" 2>&1; then
     log "${GREEN}[OK] SSH config test passed.${NC}"
 else
     log "${RED}[ERROR] SSH config has errors. Restoring backup...${NC}"
-    cp "BACKUP_FILE" "$SSHD_CONFIG"
+    cp "$BACKUP_FILE" "$SSHD_CONFIG"
     log "${YELLOW}[OK] Original SSH config restored.${NC}"
     exit 1
 fi
 
 # Restart SSH
 log "${GREEN} Restarting SSH service...${NC}"
-systemctl restart sshd
-
-if [[ $? -eq 0 ]]; then
+if systemctl restart sshd; then
     log "${GREEN}[OK] SSH service restarted successfully.${NC}"
 else
     log "${RED}[ERROR] SSH failed to restart.${NC}"
@@ -189,15 +204,23 @@ log "${GREEN}[OK] SSH allowed.${NC}"
 
 # allow HTTP and HTTPS
 log "${GREEN} Allowing HTTP and HTTPS...${NC}"
-ufw allow 80/tcp >> "$LOG_FILE" 2>&1
-ufw allow 443/tcp >> "$LOG_FILE" 2>&1
-log "${GREEN}[OK] HTTP (80) and HTTPS (443) allowed.${NC}"
+if [[ "$OPEN_HTTP" == true ]]; then
+    ufw allow 80/tcp >> "$LOG_FILE" 2>&1
+    log "${GREEN}[OK] HTTP (80) allowed.${NC}"
+else
+    log "${YELLOW}[SKIP] HTTP (80) not opened - OPEN_HTTP set to false.${NC}"
+fi
+
+if [[ "$OPEN_HTTPS" == true ]]; then
+    ufw allow 443/tcp >> "$LOG_FILE" 2>&1
+    log "${GREEN}[OK] HTTPS (443) allowed.${NC}"
+else
+    log "${YELLOW}[SKIP] HTTPS (443) not opened -OPEN_HTTPS set to false.${NC}"
+fi
 
 # enable UFW
 log "${GREEN} Enabling firewall...${NC}"
-ufw --force enable >> "$LOG_FILE" 2>&1
-
-if [[ $? -eq 0 ]]; then
+if ufw --force enable >> "$LOG_FILE" 2>&1; then
     log "${GREEN}[OK] Firewall enabled successfully.${NC}"
 else
     log "${RED}[ERROR] Failed to enable firewall.${NC}"
@@ -231,7 +254,7 @@ maxretry  = 3
 enabled   = true
 port      = ssh
 logpath   = %(sshd_log)s
-backend   = %(sshd_backend)s
+backend   = systemd
 EOF
 
 log "${GREEN}[OK] Fail2Ban jail.local created.${NC}"
@@ -239,9 +262,7 @@ log "${GREEN}[OK] Fail2Ban jail.local created.${NC}"
 # Enable and restart Fail2Ban
 log "${GREEN} Enabling Fail2Ban service...${NC}"
 systemctl enable fail2ban >> "$LOG_FILE" 2>&1
-systemctl restart fail2ban >> "LOG_FILE" 2>&1
-
-if [[ $? -eq 0 ]]; then
+if systemctl restart fail2ban >> "$LOG_FILE" 2>&1; then
     log "${GREEN}[OK] Fail2Ban service is running.${NC}"
 else
     log "${RED}[ERROR] Fail2Ban failed to start.${NC}"
@@ -268,9 +289,7 @@ log "${GREEN}[OK] Automatic security updates configured.${NC}"
 
 # enable the service
 systemctl enable unattended-upgrades >> "$LOG_FILE" 2>&1
-systemctl restart unattended-upgrades >> "LOG_FILE" 2>&1
-
-if [[ $? -eq 0 ]]; then
+if systemctl restart unattended-upgrades >> "$LOG_FILE" 2>&1; then
     log "${GREEN}[OK] Unattended upgrades service is running.${NC}"
 else
     log "${RED}[ERROR] Unattended upgrades failed to start.${NC}"
